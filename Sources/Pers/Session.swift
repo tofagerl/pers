@@ -20,6 +20,7 @@ final class Session: ObservableObject, Identifiable {
     var pastes: [Int: String] = [:]
     @Published private(set) var inputHistory: [String] = []
     @Published var liveModel: String?
+    private(set) var slashCommands: [String] = []
     @Published private(set) var outfit = Int.random(in: 0..<1000)
     @Published var git: GitInfo?
     @Published var showingDiff = false
@@ -281,9 +282,21 @@ final class Session: ObservableObject, Identifiable {
     /// Prefixes commands sent from terminal mode. Unlike `!` it can't be typed, so it never collides with a message.
     static let terminalMarker = "\u{1D}"
 
+    /// The ghost text after the draft: a shell command in terminal mode, a slash command otherwise.
+    func suggestion(for draft: String, inTerminal: Bool) -> String? {
+        inTerminal ? terminalSuggestion(for: draft) : slashSuggestion(for: draft)
+    }
+
+    /// Claude only reports its slash commands in the `init` event, so there is nothing to complete before the first turn.
+    private func slashSuggestion(for draft: String) -> String? {
+        guard draft.hasPrefix("/"), !draft.contains(" ") else { return nil }
+        let match = slashCommands.map { "/" + $0.drop { $0 == "/" } }.first { $0.hasPrefix(draft) && $0 != draft }
+        return match.map { String($0.dropFirst(draft.count)) }
+    }
+
     /// Like zsh-autosuggestions: the rest of the newest command, from zsh's history or this tab's, that starts
     /// with the draft.
-    func terminalSuggestion(for draft: String) -> String? {
+    private func terminalSuggestion(for draft: String) -> String? {
         guard !draft.isEmpty else { return nil }
         let tabCommands = inputHistory.filter { $0.hasPrefix(Self.terminalMarker) }.map { String($0.dropFirst()) }
         let match = (ShellHistory.commands + tabCommands).last { $0.hasPrefix(draft) && $0 != draft }
@@ -663,6 +676,7 @@ final class Session: ObservableObject, Identifiable {
             sessionId = event["session_id"] as? String
             forkAt = nil
             liveModel = event["model"] as? String
+            slashCommands = event["slash_commands"] as? [String] ?? []
         case "assistant":
             guard event["parent_tool_use_id"] is NSNull || event["parent_tool_use_id"] == nil,
                   let message = event["message"] as? [String: Any],

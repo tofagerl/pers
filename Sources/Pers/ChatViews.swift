@@ -691,8 +691,8 @@ struct DialogueBox: View {
     }
 
     private var suggestion: String? {
-        guard inTerminal, historyIndex == nil else { return nil }
-        return session.terminalSuggestion(for: session.draft)
+        guard !isAnswering, historyIndex == nil else { return nil }
+        return session.suggestion(for: session.draft, inTerminal: mode == .terminal)
     }
 
     private var draftFont: Font { isShell ? .system(size: 14, design: .monospaced) : Theme.body }
