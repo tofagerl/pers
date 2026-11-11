@@ -63,7 +63,7 @@ final class Session: ObservableObject, Identifiable {
     private var pendingAdvice: [String] = []
     var extraArguments: (@MainActor () -> [String])?
 
-    init(directory: String, model: ClaudeModel = .sonnet, mode: PermissionMode = .acceptEdits) {
+    init(directory: String, model: ClaudeModel = .sonnet, mode: PermissionMode = .claudeDefault) {
         id = UUID()
         self.directory = directory
         self.model = model
@@ -896,7 +896,7 @@ final class AppStore: ObservableObject {
     func newTab(directory: String? = nil) {
         let base = selected
         let session = Session(directory: directory ?? base?.directory ?? NSHomeDirectory(),
-                              model: base?.model ?? .sonnet, mode: base?.mode ?? .acceptEdits)
+                              model: base?.model ?? .sonnet, mode: base?.mode ?? .claudeDefault)
         sessions.append(session)
         selectedId = session.id
     }

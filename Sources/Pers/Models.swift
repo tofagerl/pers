@@ -25,6 +25,14 @@ enum PermissionMode: String, CaseIterable, Codable, Identifiable {
         case .bypassPermissions: "BYPASS"
         }
     }
+
+    /// What Claude Code itself would start in: `permissions.defaultMode` from the user's settings, else manual ("default" in the CLI).
+    static var claudeDefault: PermissionMode {
+        let url = URL(fileURLWithPath: NSHomeDirectory() + "/.claude/settings.json")
+        let name = (try? JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+            .flatMap { ($0["permissions"] as? [String: Any])?["defaultMode"] as? String }
+        return name.flatMap(PermissionMode.init(rawValue:)) ?? .manual
+    }
 }
 
 enum Effort: String, CaseIterable, Codable, Identifiable {
