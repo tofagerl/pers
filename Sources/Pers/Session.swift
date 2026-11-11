@@ -418,6 +418,13 @@ final class Session: ObservableObject, Identifiable {
         }
     }
 
+    /// The user's autoCompactWindow from ~/.claude/settings.json, if set.
+    private static var autoCompactWindow: Int? {
+        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/settings.json")
+        let settings = (try? Data(contentsOf: url)).flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+        return settings?["autoCompactWindow"] as? Int
+    }
+
     private static func tokens(in result: [String: Any]) -> Int {
         let usage = result["usage"] as? [String: Any] ?? [:]
         return ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"]
@@ -702,7 +709,9 @@ final class Session: ObservableObject, Identifiable {
             // Subagents on other models are listed too, so prefer the entry for the model this session runs.
             let models = event["modelUsage"] as? [String: [String: Any]] ?? [:]
             let main = models.first { liveModel?.hasPrefix($0.key) == true }?.value ?? models.values.first
-            contextWindow = main?["contextWindow"] as? Int ?? contextWindow
+            let window = main?["contextWindow"] as? Int ?? contextWindow
+            // Compaction kicks in at the user's autoCompactWindow, so measure against that when it is lower.
+            contextWindow = Self.autoCompactWindow.map { min($0, window ?? $0) } ?? window
             // Closing stdin lets the CLI exit now that the turn is over.
             try? input?.close()
             input = nil
