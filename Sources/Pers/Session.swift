@@ -31,6 +31,8 @@ final class Session: ObservableObject, Identifiable {
     @Published private(set) var openedCommit: Commit?
     /// Claude is taking a turn. Terminal commands run alongside it, so they don't count.
     @Published private(set) var isBusy = false
+    /// Messages sent during a turn, in order. Each is sent when the turn before it finishes.
+    @Published private(set) var queued: [String] = []
     @Published private(set) var typingId: UUID?
     @Published private(set) var revealed = 0
     @Published private(set) var prompt: PermissionPrompt?
@@ -263,7 +265,12 @@ final class Session: ObservableObject, Identifiable {
         stopTerminal()
     }
 
+    func cancelQueued(at index: Int) {
+        if queued.indices.contains(index) { queued.remove(at: index) }
+    }
+
     func stopClaude() {
+        queued = []
         process?.terminate()
         resolveFix("Cancel")
     }
@@ -303,12 +310,17 @@ final class Session: ObservableObject, Identifiable {
         return match.map { String($0.dropFirst(draft.count)) }
     }
 
-    /// A terminal command and a Claude turn can run at the same time, but only one of each. Returns whether it was sent.
+    /// A terminal command and a Claude turn can run at the same time, but only one of each. A message for Claude that
+    /// arrives mid-turn is queued. Returns whether it was sent or queued.
     @discardableResult
     func send(_ text: String) -> Bool {
         let command = text.hasPrefix("!") || text.hasPrefix(Self.terminalMarker) ? String(text.dropFirst()) : nil
         // thefuck asks for confirmation through Claude's permission prompt, so it takes Claude's turn.
         let usesClaude = command == nil || command?.trimmed == "fuck"
+        if isBusy, command == nil, !text.trimmed.isEmpty {
+            queued.append(text.trimmed)
+            return true
+        }
         guard usesClaude ? !isBusy : !isRunningShell, !text.trimmed.isEmpty || !images.isEmpty else { return false }
         checkTranscript()
         if !text.trimmed.isEmpty, inputHistory.last != text { inputHistory = Array((inputHistory + [text]).suffix(100)) }
@@ -368,7 +380,7 @@ final class Session: ObservableObject, Identifiable {
                 finish(error: stderr.isEmpty ? "claude exited with status \(process.terminationStatus)" : stderr)
             } else {
                 finish(error: nil)
-                if advising { advise() }
+                if !queued.isEmpty { send(queued.removeFirst()) } else if advising { advise() }
             }
         }
         return true

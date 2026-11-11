@@ -387,6 +387,8 @@ struct DialogueBox: View {
             }
 
             VStack(alignment: .leading, spacing: -8) {
+                QueuedMessages(session: session)
+                    .padding(.horizontal, 18)
                 HStack(spacing: 10) {
                     HStack(spacing: 0) {
                         TimelineView(.periodic(from: .now, by: 0.4)) { timeline in
@@ -756,6 +758,24 @@ struct DialogueBox: View {
             return
         }
         session.draft = ""
+    }
+}
+
+/// Messages waiting for the current turn to finish. Each can be cancelled.
+struct QueuedMessages: View {
+    @ObservedObject var session: Session
+
+    var body: some View {
+        ForEach(Array(session.queued.enumerated()), id: \.offset) { index, text in
+            HStack(spacing: 8) {
+                Text("QUEUED").font(Theme.ui(11, weight: .black)).foregroundStyle(Theme.gold)
+                Text(text).lineLimit(1).foregroundStyle(Theme.dim)
+                Spacer(minLength: 0)
+                Button { session.cancelQueued(at: index) } label: { Text("×").foregroundStyle(Theme.dim) }
+                    .buttonStyle(.plain)
+                    .help("Cancel")
+            }
+        }
     }
 }
 

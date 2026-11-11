@@ -25,6 +25,7 @@ struct ClaudeBar: View {
             } else if !replies.isEmpty && session.messages.count > dismissed {
                 replyPanel
             }
+            QueuedMessages(session: session)
             inputRow
             KeyHints(hints: shownHints, highlighted: highlighted)
         }
