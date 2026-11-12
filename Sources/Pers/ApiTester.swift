@@ -93,9 +93,10 @@ struct APIResponse: Codable {
 }
 
 extension AppStore {
-    /// Repos with open tabs come first, in tab order, followed by folders made from the terminal and repos that only have saved requests.
+    /// Repos with open tabs, folders made from the terminal and repos that only have saved requests, sorted by folder name.
     var requestFolders: [String] {
-        (repos.map(\.path) + savedFolders + requests.map(\.repo)).reduce(into: []) { if !$0.contains($1) { $0.append($1) } }
+        (repos.map(\.path) + savedFolders + requests.map(\.repo)).reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+            .sorted { ($0 as NSString).lastPathComponent.localizedCaseInsensitiveCompare(($1 as NSString).lastPathComponent) == .orderedAscending }
     }
 
     func openFolder(_ path: String?) {

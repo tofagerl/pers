@@ -48,7 +48,8 @@ struct MessageLog: View {
                         MessageRow(message: message, text: session.visibleText(of: message),
                                    hovered: hovered, armedKey: hovered ? navigator.armedKey : nil,
                                    hints: hovered ? navigationHints + (session.hasTerminal(message) ? [(KeyAction.select.label, "open terminal")] : []) : [],
-                                   status: running ? session.terminalStatus + " · \(KeyAction.terminal.label) to open" : nil)
+                                   status: running ? session.terminalStatus + " · \(KeyAction.terminal.label) to open" : nil,
+                                   toolRunning: session.runningTools.values.contains(message.id))
                             .id(message.id)
                     }
                     if let prompt = session.prompt {
@@ -217,6 +218,7 @@ struct MessageRow: View {
     var hints: [(key: String, action: String)] = []
     /// What a running terminal command is doing.
     var status: String?
+    var toolRunning = false
 
     private var forking: Bool { armedKey != nil }
 
@@ -266,9 +268,9 @@ struct MessageRow: View {
                 Spacer(minLength: 120)
             }
         case .tool:
-            let parts = text.split(separator: "\t", maxSplits: 1).map(String.init)
+            let tool = message.toolParts
             VStack(alignment: .leading, spacing: 6) {
-                toolRow(name: parts.first?.uppercased() ?? "TOOL", detail: parts.count > 1 ? parts[1] : nil)
+                toolRow(name: tool.name.uppercased(), detail: tool.detail, description: tool.description, running: toolRunning)
                 if let edits = message.edits { EditDiff(edits: edits).padding(.leading, 18) }
             }
         case .shell:
@@ -301,8 +303,11 @@ struct MessageRow: View {
             }
     }
 
-    private func toolRow(name: String, detail: String?, trailing: Bool = false, color: Color = Theme.cyan) -> some View {
-        let tag = Text(name)
+    private func toolRow(name: String, detail: String?, description: String? = nil, running: Bool = false,
+                         trailing: Bool = false, color: Color = Theme.cyan) -> some View {
+        let tag = TimelineView(.periodic(from: .now, by: 0.1)) { timeline in
+            Text(running ? "\(Self.spinner(at: timeline.date)) \(name)" : name)
+        }
             .font(Theme.ui(13, weight: .black))
             .foregroundStyle(Theme.navy)
             .padding(.horizontal, 12)
@@ -310,16 +315,22 @@ struct MessageRow: View {
             .background(Slant(amount: 7).fill(color))
         let command = detail.map {
             Text($0)
-                .font(Theme.code)
+                .font(description == nil ? Theme.code : .system(size: 10.5, design: .monospaced))
                 .foregroundStyle(Theme.dim)
                 .lineLimit(1)
                 .truncationMode(.middle)
         }
-        return HStack(alignment: .center, spacing: 10) {
+        return HStack(alignment: description == nil ? .center : .firstTextBaseline, spacing: 10) {
             if trailing {
                 Spacer(minLength: 100)
                 command
                 tag
+            } else if let description {
+                tag
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(description).font(Theme.body).foregroundStyle(Theme.text).lineLimit(2)
+                    command
+                }
             } else {
                 tag
                 command
@@ -327,6 +338,11 @@ struct MessageRow: View {
         }
         .padding(trailing ? .trailing : .leading, 18)
         .textSelection(.enabled)
+    }
+
+    private static func spinner(at date: Date) -> Character {
+        let frames = Array("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+        return frames[Int(date.timeIntervalSinceReferenceDate * 10) % frames.count]
     }
 
     private func bubble<Content: View>(name: String, plate: Color, light: Bool, alignment: HorizontalAlignment,

@@ -55,7 +55,8 @@ struct ClaudeBar: View {
 
     private var activity: String {
         guard session.isBusy, let tool = session.messages.last(where: { $0.speaker == .tool }) else { return "thinking" }
-        return tool.text.replacingOccurrences(of: "\t", with: " ")
+        let parts = tool.toolParts
+        return [parts.name, parts.description ?? parts.detail].compactMap { $0 }.joined(separator: " ")
     }
 
     private var inputRow: some View {
