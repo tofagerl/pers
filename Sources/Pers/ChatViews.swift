@@ -51,6 +51,11 @@ struct MessageLog: View {
                                    status: running ? session.terminalStatus + " · \(KeyAction.terminal.label) to open" : nil)
                             .id(message.id)
                     }
+                    if let prompt = session.prompt {
+                        PermissionBox(session: session, navigator: navigator, prompt: prompt)
+                            .id(prompt.step)
+                            .transition(.scale(scale: 0.6, anchor: .topLeading).combined(with: .opacity))
+                    }
                     Color.clear.frame(height: 1).id("bottom")
                 }
                 .padding(.horizontal, 24)
@@ -68,6 +73,7 @@ struct MessageLog: View {
                 let userInitiated = session.messages.last.map { [.user, .shell].contains($0.speaker) } ?? false
                 if !navigator.active && (userInitiated || scroller.followsBottom) { scrollDown(proxy) }
             }
+            .onChange(of: session.prompt?.step) { if !navigator.active { scrollDown(proxy) } }
             .onChange(of: session.revealed) { if !navigator.active && scroller.followsBottom { scrollDown(proxy, animated: false) } }
             .onChange(of: session.messages.last?.text) { if !navigator.active && scroller.followsBottom { scrollDown(proxy, animated: false) } }
             .onChange(of: session.boxedMessages.count) {
@@ -103,15 +109,6 @@ struct MessageLog: View {
             }
         }
         .animation(.easeOut(duration: 0.15), value: navigator.newMessage)
-        .overlay(alignment: .trailing) {
-            if let prompt = session.prompt {
-                PermissionBox(session: session, navigator: navigator, prompt: prompt)
-                    .id(prompt.step)
-                    .padding(.trailing, 28)
-                    .transition(.scale(scale: 0.6, anchor: .trailing).combined(with: .opacity))
-            }
-        }
-        .animation(.spring(response: 0.35, dampingFraction: 0.6), value: session.prompt?.step)
     }
 
     private func showLatest() {
@@ -1041,7 +1038,7 @@ private struct PermissionBox: View {
                 }
             }
         }
-        .frame(width: 300)
+        .frame(maxWidth: 560, alignment: .leading)
         .animation(Theme.isTerminal ? nil : .easeInOut(duration: Theme.isStylized ? 0.35 : 0.15), value: navigator.active)
     }
 
