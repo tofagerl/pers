@@ -104,8 +104,8 @@ struct ClaudeBar: View {
     }
 
     private var suggestion: String? {
-        guard mode == .terminal, session.prompt?.question == nil else { return nil }
-        return session.terminalSuggestion(for: draft)
+        guard session.prompt?.question == nil else { return nil }
+        return session.suggestion(for: draft, inTerminal: mode == .terminal)
     }
 
     private var placeholder: String {
