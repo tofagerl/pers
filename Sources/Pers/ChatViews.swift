@@ -777,17 +777,28 @@ struct DialogueBox: View {
     }
 }
 
-/// Messages waiting for the current turn to finish. Each can be cancelled.
+/// Messages waiting for the current turn to finish. The oldest, or all of them, can be sent into the turn now, and
+/// each can be cancelled.
 struct QueuedMessages: View {
     @ObservedObject var session: Session
 
     var body: some View {
-        ForEach(Array(session.queued.enumerated()), id: \.offset) { index, text in
+        ForEach(Array(session.queued.enumerated()), id: \.element.id) { index, message in
             HStack(spacing: 8) {
                 Text("QUEUED").font(Theme.ui(11, weight: .black)).foregroundStyle(Theme.gold)
-                Text(text).lineLimit(1).foregroundStyle(Theme.dim)
+                Text(message.text).lineLimit(1).foregroundStyle(Theme.dim)
                 Spacer(minLength: 0)
-                Button { session.cancelQueued(at: index) } label: { Text("×").foregroundStyle(Theme.dim) }
+                if index == 0 {
+                    Button { session.sendQueuedNow(all: false) } label: { Text("SEND NOW").foregroundStyle(Theme.gold) }
+                        .buttonStyle(.plain)
+                        .help("Send into the current turn")
+                    if session.queued.count > 1 {
+                        Button { session.sendQueuedNow(all: true) } label: { Text("SEND ALL").foregroundStyle(Theme.gold) }
+                            .buttonStyle(.plain)
+                            .help("Send every queued message into the current turn")
+                    }
+                }
+                Button { session.cancelQueued(message.id) } label: { Text("×").foregroundStyle(Theme.dim) }
                     .buttonStyle(.plain)
                     .help("Cancel")
             }
