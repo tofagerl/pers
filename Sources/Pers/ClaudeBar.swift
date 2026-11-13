@@ -47,9 +47,11 @@ struct ClaudeBar: View {
         return hints + (session.isBusy || session.isRunningShell ? [(KeyAction.stop.label, "stop")] : [])
     }
 
-    /// What Claude or the shell said since the last thing the user sent.
+    /// What Claude or the shell said since the last thing the user sent. Queued messages haven't been sent yet.
     private var replies: [ChatMessage] {
-        let start = (session.messages.lastIndex { $0.speaker == .user } ?? -1) + 1
+        let start = (session.messages.lastIndex { message in
+            message.speaker == .user && !session.queued.contains { $0.id == message.id }
+        } ?? -1) + 1
         return session.messages[start...].filter { [.claude, .shell, .system].contains($0.speaker) }
     }
 

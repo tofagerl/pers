@@ -31,8 +31,9 @@ final class Session: ObservableObject, Identifiable {
     @Published private(set) var openedCommit: Commit?
     /// Claude is taking a turn. Terminal commands run alongside it, so they don't count.
     @Published private(set) var isBusy = false
-    /// Messages sent during a turn, in order. Each is sent when the turn before it finishes.
-    @Published private(set) var queued: [String] = []
+    /// Messages sent during a turn, oldest first. They show in the chat right away; each goes to Claude when the turn
+    /// before it finishes, or sooner through `sendQueuedNow`.
+    @Published private(set) var queued: [ChatMessage] = []
     @Published private(set) var typingId: UUID?
     @Published private(set) var revealed = 0
     @Published private(set) var prompt: PermissionPrompt?
@@ -267,12 +268,21 @@ final class Session: ObservableObject, Identifiable {
         stopTerminal()
     }
 
-    func cancelQueued(at index: Int) {
-        if queued.indices.contains(index) { queued.remove(at: index) }
+    func cancelQueued(_ id: UUID) {
+        queued.removeAll { $0.id == id }
+        messages.removeAll { $0.id == id }
+    }
+
+    /// Hands the oldest queued message, or all of them, to the running turn. Claude reads them at its next step.
+    func sendQueuedNow(all: Bool) {
+        guard input != nil, !queued.isEmpty else { return }
+        let sending = all ? queued : [queued[0]]
+        queued.removeFirst(sending.count)
+        for message in sending { write(["type": "user", "message": ["role": "user", "content": message.text]]) }
     }
 
     func stopClaude() {
-        queued = []
+        queued.forEach { cancelQueued($0.id) }
         process?.terminate()
         resolveFix("Cancel")
     }
@@ -313,22 +323,30 @@ final class Session: ObservableObject, Identifiable {
     }
 
     /// A terminal command and a Claude turn can run at the same time, but only one of each. A message for Claude that
-    /// arrives mid-turn is queued. Returns whether it was sent or queued.
+    /// arrives mid-turn is queued. Returns whether it was sent or queued. `queuedAs` is the chat message a queued text
+    /// already has.
     @discardableResult
-    func send(_ text: String) -> Bool {
+    func send(_ text: String, queuedAs queuedId: UUID? = nil) -> Bool {
         let command = text.hasPrefix("!") || text.hasPrefix(Self.terminalMarker) ? String(text.dropFirst()) : nil
         // thefuck asks for confirmation through Claude's permission prompt, so it takes Claude's turn.
         let usesClaude = command == nil || command?.trimmed == "fuck"
         if isBusy, command == nil, !text.trimmed.isEmpty {
-            queued.append(text.trimmed)
+            if inputHistory.last != text { inputHistory = Array((inputHistory + [text]).suffix(100)) }
+            let message = ChatMessage(speaker: .user, text: text.trimmed)
+            messages.append(message)
+            queued.append(message)
             return true
         }
         guard usesClaude ? !isBusy : !isRunningShell, !text.trimmed.isEmpty || !images.isEmpty else { return false }
         checkTranscript()
-        if !text.trimmed.isEmpty, inputHistory.last != text { inputHistory = Array((inputHistory + [text]).suffix(100)) }
+        if queuedId == nil, !text.trimmed.isEmpty, inputHistory.last != text { inputHistory = Array((inputHistory + [text]).suffix(100)) }
         let attached = images
         images = []
-        messages.append(ChatMessage(speaker: .user, text: text.trimmed, images: attached.isEmpty ? nil : attached))
+        if let index = messages.firstIndex(where: { $0.id == queuedId }) {
+            if !attached.isEmpty { messages[index].images = attached }
+        } else {
+            messages.append(ChatMessage(speaker: .user, text: text.trimmed, images: attached.isEmpty ? nil : attached))
+        }
         if let command, !usesClaude {
             runShell(command)
             return true
@@ -382,7 +400,12 @@ final class Session: ObservableObject, Identifiable {
                 finish(error: stderr.isEmpty ? "claude exited with status \(process.terminationStatus)" : stderr)
             } else {
                 finish(error: nil)
-                if !queued.isEmpty { send(queued.removeFirst()) } else if advising { advise() }
+                if !queued.isEmpty {
+                    let next = queued.removeFirst()
+                    send(next.text, queuedAs: next.id)
+                } else if advising {
+                    advise()
+                }
             }
         }
         return true
