@@ -209,6 +209,36 @@ private struct EditDiff: View {
     }
 }
 
+/// What you wrote, in a box of limited height once it gets long, like terminal output, so big pastes don't flood the log.
+private struct UserText: View {
+    var text: String
+    @ViewState private var contentHeight: CGFloat?
+    private static let maxHeight: CGFloat = 320
+
+    var body: some View {
+        let lines = text.utf8.lazy.filter { $0 == 10 }.count + 1
+        if lines > 15 || text.count > 1500 {
+            ScrollView(.vertical) { label }
+                // Starts from the unwrapped line count so the box is close to its final height on first layout.
+                .frame(height: min(contentHeight ?? CGFloat(lines) * 19, Self.maxHeight))
+                .defaultScrollAnchor(.top)
+                .scrollBounceBehavior(.basedOnSize)
+                .onScrollGeometryChange(for: CGFloat.self, of: { $0.contentSize.height }) { contentHeight = $1 }
+        } else {
+            label
+        }
+    }
+
+    private var label: some View {
+        Text(text)
+            .font(Theme.body)
+            .foregroundStyle(Theme.isStylized ? Theme.navy : Theme.text)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 struct MessageRow: View {
     @EnvironmentObject var store: AppStore
     var message: ChatMessage
@@ -243,13 +273,7 @@ struct MessageRow: View {
                                     .onTapGesture { store.previewImage = image }
                             }
                         }
-                        if !text.isEmpty {
-                            Text(text)
-                                .font(Theme.body)
-                                .foregroundStyle(Theme.isStylized ? Theme.navy : Theme.text)
-                                .textSelection(.enabled)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
+                        if !text.isEmpty { UserText(text: text) }
                     }
                 }
             }

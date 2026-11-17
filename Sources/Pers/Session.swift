@@ -369,11 +369,9 @@ final class Session: ObservableObject, Identifiable {
 
         Task {
             var gotResult = false
-            do {
-                for try await line in out.fileHandleForReading.bytes.lines {
-                    if handle(line: line) { gotResult = true }
-                }
-            } catch {}
+            for await line in Self.lines(of: out) {
+                if handle(line: line) { gotResult = true }
+            }
             process.waitUntilExit()
             let stderr = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmed
             if process.terminationReason == .uncaughtSignal || process.terminationStatus == 143 {
@@ -551,6 +549,25 @@ final class Session: ObservableObject, Identifiable {
         }
     }
 
+    /// `FileHandle.bytes` reads every handle on one shared queue, so a session whose CLI sits quietly on a prompt
+    /// would stall the output of every other session.
+    static func lines(of pipe: Pipe) -> AsyncStream<String> {
+        AsyncStream { continuation in
+            Task {
+                var buffer = Data()
+                for await chunk in chunks(of: pipe) {
+                    buffer.append(chunk)
+                    while let newline = buffer.firstIndex(of: 0x0A) {
+                        continuation.yield(String(decoding: buffer[..<newline], as: UTF8.self))
+                        buffer.removeSubrange(...newline)
+                    }
+                }
+                if !buffer.isEmpty { continuation.yield(String(decoding: buffer, as: UTF8.self)) }
+                continuation.finish()
+            }
+        }
+    }
+
     /// thefuck runs in a shell of its own, without the tab's history, so it gets the tab's previous command
     /// through TF_HISTORY instead of `fc`. Its own confirmation needs a tty, so the correction is confirmed with a prompt.
     private func fixLastCommand() {
@@ -576,9 +593,7 @@ final class Session: ObservableObject, Identifiable {
 
         Task {
             var correction = ""
-            do {
-                for try await line in out.fileHandleForReading.bytes.lines where !line.trimmed.isEmpty { correction = line }
-            } catch {}
+            for await line in Self.lines(of: out) where !line.trimmed.isEmpty { correction = line }
             process.waitUntilExit()
             if process.terminationReason == .uncaughtSignal { return finish(error: "Interrupted.") }
             guard !correction.isEmpty else { return finish(error: "No fucks given.") }

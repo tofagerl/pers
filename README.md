@@ -81,6 +81,14 @@ Action fields:
 
 Don't put literal secrets in `environment`: the file is plain text. Look them up instead, for example `TOKEN=$(security find-generic-password -s name -w)`. The app warns when a credential-like variable has a typed-in value.
 
+## API tester requests
+
+Saved requests live in `~/Library/Application Support/Pers/requests.json`, grouped into folders by `repo`, the absolute path of a repo's main checkout. The app reloads the file when it is replaced and opens the newly added request.
+
+The repo ships a Claude Code skill, `pers-create-api-request`, in `.claude/skills/pers-create-api-request/`. Ask Claude in any repo to "make a pers request for /search" and it reads the repo's routes and config, names the request in the style of that folder's existing ones and writes it to `requests.json`.
+
+To use the skill from other repos, copy the folder to `~/.claude/skills/pers-create-api-request/`.
+
 ## Features
 
 **Claude sessions**
