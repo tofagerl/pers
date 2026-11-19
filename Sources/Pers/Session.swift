@@ -879,7 +879,7 @@ final class AppStore: ObservableObject {
     private static let selectedKey = "selectedSession"
     private static let foldersKey = "requestFolders"
 
-    private static let supportDirectory: URL = {
+    nonisolated static let supportDirectory: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Pers", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

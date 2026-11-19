@@ -952,7 +952,8 @@ private struct LoadData: View {
     @EnvironmentObject var store: AppStore
     @Environment(\.dismiss) private var dismiss
     var session: Session
-    @ViewState private var saves: [SavedSession]?
+    @ViewState private var saves: [SavedSession] = []
+    @ViewState private var reading = true
     @ViewState private var selected = 0
     @FocusState private var focused: Bool
 
@@ -962,10 +963,12 @@ private struct LoadData: View {
                 .padding(.horizontal, 18)
                 .zIndex(1)
             Group {
-                if let saves, saves.isEmpty {
+                if saves.isEmpty && reading {
+                    ProgressView("Reading save data…")
+                } else if saves.isEmpty {
                     Text("No saved sessions found.")
                         .foregroundStyle(Theme.dim)
-                } else if let saves {
+                } else {
                     ScrollViewReader { proxy in
                         ScrollView {
                             LazyVStack(alignment: .leading, spacing: 4) {
@@ -981,8 +984,6 @@ private struct LoadData: View {
                             if let id = selectedSave?.id { proxy.scrollTo(id) }
                         }
                     }
-                } else {
-                    ProgressView("Reading save data…")
                 }
             }
             .font(Theme.body)
@@ -1011,17 +1012,24 @@ private struct LoadData: View {
         .onKeyPress(phases: [.down, .repeat], action: select)
         .task {
             focused = true
-            saves = await Task.detached { SaveData.list() }.value
+            let updates = AsyncStream<[SavedSession]> { continuation in
+                Task.detached {
+                    SaveData.list { continuation.yield($0) }
+                    continuation.finish()
+                }
+            }
+            for await found in updates { saves = found }
+            reading = false
         }
     }
 
     private var selectedSave: SavedSession? {
-        guard let saves, !saves.isEmpty else { return nil }
+        guard !saves.isEmpty else { return nil }
         return saves[min(selected, saves.count - 1)]
     }
 
     private func select(_ press: KeyPress) -> KeyPress.Result {
-        guard let saves, let save = selectedSave else { return .ignored }
+        guard let save = selectedSave else { return .ignored }
         switch press.action(in: .navigation) {
         case .up: selected = max(selected - 1, 0)
         case .down: selected = min(selected + 1, saves.count - 1)
