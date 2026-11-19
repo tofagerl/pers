@@ -18,18 +18,72 @@ enum SaveData {
             return nil
         }
         return folders.flatMap { folder in
-            ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
+            ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey])) ?? [])
                 .filter { $0.pathExtension == "jsonl" }
         }
     }
 
     static func title(ofSession sessionId: String) -> String? {
-        transcripts()?.first { $0.lastPathComponent == "\(sessionId).jsonl" }.flatMap { summary(of: $0, opened: [:])?.title }
+        transcripts()?.first { $0.lastPathComponent == "\(sessionId).jsonl" }.flatMap { summary(of: $0).title }
     }
 
-    static func list() -> [SavedSession] {
+    /// Calls `update` with every session found so far, newest first: once from the cache, where a changed transcript keeps
+    /// its old title until it is read again, then after each batch of transcripts read in parallel.
+    static func list(update: ([SavedSession]) -> Void) {
         let opened = UserDefaults.standard.dictionary(forKey: openedKey) as? [String: Date] ?? [:]
-        return (transcripts() ?? []).compactMap { summary(of: $0, opened: opened) }.sorted { $0.updated > $1.updated }
+        let cache = (try? Data(contentsOf: cacheURL)).flatMap { try? JSONDecoder().decode([String: Summary].self, from: $0) } ?? [:]
+        var summaries: [String: Summary] = [:], stale: [(url: URL, modified: Date, size: Int)] = []
+        var found: [String: SavedSession] = [:]
+        for url in transcripts() ?? [] {
+            let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+            let modified = values?.contentModificationDate ?? .distantPast, size = values?.fileSize ?? 0
+            let cached = cache[url.path]
+            if let cached, cached.modified == modified, cached.size == size {
+                summaries[url.path] = cached
+            } else {
+                stale.append((url, modified, size))
+            }
+            found[url.path] = cached?.session(at: url, modified: modified, opened: opened)
+        }
+        let sorted = { found.values.sorted { $0.updated > $1.updated } }
+        update(sorted())
+        let lock = NSLock()
+        for start in stride(from: 0, to: stale.count, by: batchSize) {
+            let batch = stale[start..<min(start + batchSize, stale.count)]
+            DispatchQueue.concurrentPerform(iterations: batch.count) { offset in
+                let file = batch[batch.startIndex + offset]
+                var read = summary(of: file.url)
+                (read.modified, read.size) = (file.modified, file.size)
+                // A pasted prompt can be a whole file, and rows only show one line.
+                read.title = read.title.map { String($0.prefix { $0 != "\n" }.prefix(200)) }
+                lock.withLock { summaries[file.url.path] = read }
+            }
+            for file in batch {
+                found[file.url.path] = summaries[file.url.path]?.session(at: file.url, modified: file.modified, opened: opened)
+            }
+            update(sorted())
+        }
+        if !stale.isEmpty || summaries.count != cache.count, let data = try? JSONEncoder().encode(summaries) {
+            try? data.write(to: cacheURL, options: .atomic)
+        }
+    }
+
+    /// Small enough that the list fills in steadily, large enough to keep every core busy.
+    private static let batchSize = 64
+    private static let cacheURL = AppStore.supportDirectory.appendingPathComponent("saves.json")
+
+    /// What the list needs from a transcript, cached with the file's date and size so unchanged transcripts aren't read again.
+    private struct Summary: Codable {
+        var title: String?
+        var directory: String?
+        var modified = Date.distantPast
+        var size = 0
+
+        func session(at url: URL, modified: Date, opened: [String: Date]) -> SavedSession? {
+            guard let title, let directory else { return nil }
+            let id = url.deletingPathExtension().lastPathComponent
+            return SavedSession(id: id, title: title, directory: directory, updated: max(modified, opened[id] ?? .distantPast), url: url)
+        }
     }
 
     /// Opening a session doesn't touch its transcript, so the app keeps its own record to sort by.
@@ -42,7 +96,7 @@ enum SaveData {
     private static let openedKey = "openedSessions"
 
     /// A name the user gave wins over the CLI's generated title, which wins over the first prompt.
-    private static func summary(of url: URL, opened: [String: Date]) -> SavedSession? {
+    private static func summary(of url: URL) -> Summary {
         var customTitle: String?, aiTitle: String?, firstPrompt: String?, directory: String?
         // Transcripts run to megabytes of tool output, so only lines that can hold a title or the first prompt are parsed.
         let lines = events(in: url) { line in
@@ -59,11 +113,7 @@ enum SaveData {
             default: break
             }
         }
-        guard let directory, let title = customTitle ?? aiTitle ?? firstPrompt else { return nil }
-        let id = url.deletingPathExtension().lastPathComponent
-        let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-        return SavedSession(id: id, title: title.trimmed, directory: directory,
-                            updated: max(modified, opened[id] ?? .distantPast), url: url)
+        return Summary(title: (customTitle ?? aiTitle ?? firstPrompt)?.trimmed, directory: directory)
     }
 
     static func messages(in url: URL) -> [ChatMessage] {
