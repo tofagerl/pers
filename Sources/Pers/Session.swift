@@ -31,13 +31,18 @@ final class Session: ObservableObject, Identifiable {
     @Published private(set) var openedCommit: Commit?
     /// Claude is taking a turn. Terminal commands run alongside it, so they don't count.
     @Published private(set) var isBusy = false
-    /// Messages sent during a turn, in order. Each is sent when the turn before it finishes.
-    @Published private(set) var queued: [String] = []
+    /// Messages sent during a turn, oldest first. They show in the chat right away; each goes to Claude when the turn
+    /// before it finishes, or sooner through `sendQueuedNow`.
+    @Published private(set) var queued: [ChatMessage] = []
     @Published private(set) var typingId: UUID?
     @Published private(set) var revealed = 0
     @Published private(set) var prompt: PermissionPrompt?
     /// Tool calls Claude started that have no result yet, keyed by tool use id.
     @Published private(set) var runningTools: [String: UUID] = [:]
+    /// Tasks Claude left running in the background. The CLI stays up until they finish.
+    @Published private(set) var backgroundTasks: [BackgroundTask] = []
+    /// Commands of background tool calls by tool use id, picked up when their task starts.
+    private var backgroundCommands: [String: String] = [:]
     /// The tab's shell, started by its first terminal command and kept for the next ones.
     @Published private(set) var shell: ShellTerminal?
     @Published private(set) var terminalMode = ShellTerminal.Mode()
@@ -59,11 +64,16 @@ final class Session: ObservableObject, Identifiable {
     private var forkAt: String?
     private var process: Process?
     private var input: FileHandle?
-    private var hasBackgroundTasks = false
     private var typer: Timer?
     private var fix: String?
     private var advisor: Process?
     private var pendingAdvice: [String] = []
+    /// The message Claude is working on, kept so a failed turn can be sent again.
+    private var turn: Turn?
+    /// The error the turn's `result` event reported, if any.
+    private var turnError: String?
+    /// The pause before a failed turn is sent again.
+    private var retryTask: Task<Void, Never>?
     var extraArguments: (@MainActor () -> [String])?
 
     init(directory: String, model: ClaudeModel = .sonnet, mode: PermissionMode = .claudeDefault) {
@@ -245,11 +255,7 @@ final class Session: ObservableObject, Identifiable {
         contextTokens = nil
         outfit = Int.random(in: 0..<1000)
         // A CLI kept open for background tasks belongs to the old session; it finishes them unseen.
-        if !isBusy {
-            closeInput()
-            process = nil
-            hasBackgroundTasks = false
-        }
+        if !isBusy { releaseClaude() }
         advisor?.terminate()
         advisor = nil
         pendingAdvice = []
@@ -274,13 +280,27 @@ final class Session: ObservableObject, Identifiable {
         stopTerminal()
     }
 
-    func cancelQueued(at index: Int) {
-        if queued.indices.contains(index) { queued.remove(at: index) }
+    func cancelQueued(_ id: UUID) {
+        queued.removeAll { $0.id == id }
+        messages.removeAll { $0.id == id }
+    }
+
+    /// Hands the oldest queued message, or all of them, to the running turn. Claude reads them at its next step.
+    func sendQueuedNow(all: Bool) {
+        guard input != nil, !queued.isEmpty else { return }
+        let sending = all ? queued : [queued[0]]
+        queued.removeFirst(sending.count)
+        for message in sending { write(["type": "user", "message": ["role": "user", "content": message.text]]) }
     }
 
     func stopClaude() {
-        queued = []
+        queued.forEach { cancelQueued($0.id) }
         process?.terminate()
+        if let retryTask {
+            retryTask.cancel()
+            self.retryTask = nil
+            finish(error: "Claude was interrupted.")
+        }
         resolveFix("Cancel")
     }
 
@@ -320,22 +340,31 @@ final class Session: ObservableObject, Identifiable {
     }
 
     /// A terminal command and a Claude turn can run at the same time, but only one of each. A message for Claude that
-    /// arrives mid-turn is queued. Returns whether it was sent or queued.
+    /// arrives mid-turn is queued. Returns whether it was sent or queued. `queuedAs` is the chat message a queued text
+    /// already has.
     @discardableResult
-    func send(_ text: String) -> Bool {
+    func send(_ text: String, queuedAs queuedId: UUID? = nil) -> Bool {
         let command = text.hasPrefix("!") || text.hasPrefix(Self.terminalMarker) ? String(text.dropFirst()) : nil
         // thefuck asks for confirmation through Claude's permission prompt, so it takes Claude's turn.
         let usesClaude = command == nil || command?.trimmed == "fuck"
         if isBusy, command == nil, !text.trimmed.isEmpty {
-            queued.append(text.trimmed)
+            if inputHistory.last != text { inputHistory = Array((inputHistory + [text]).suffix(100)) }
+            let message = ChatMessage(speaker: .user, text: text.trimmed)
+            messages.append(message)
+            queued.append(message)
             return true
         }
         guard usesClaude ? !isBusy : !isRunningShell, !text.trimmed.isEmpty || !images.isEmpty else { return false }
         checkTranscript()
-        if !text.trimmed.isEmpty, inputHistory.last != text { inputHistory = Array((inputHistory + [text]).suffix(100)) }
+        if queuedId == nil, !text.trimmed.isEmpty, inputHistory.last != text { inputHistory = Array((inputHistory + [text]).suffix(100)) }
         let attached = images
         images = []
-        messages.append(ChatMessage(speaker: .user, text: text.trimmed, images: attached.isEmpty ? nil : attached))
+        if let index = messages.firstIndex(where: { $0.id == queuedId }) {
+            if !attached.isEmpty { messages[index].images = attached }
+        } else {
+            messages.append(ChatMessage(speaker: .user, text: text.trimmed, images: attached.isEmpty ? nil : attached))
+        }
+        AppStore.recordUse(of: repoPath)
         if let command, !usesClaude {
             runShell(command)
             return true
@@ -345,16 +374,31 @@ final class Session: ObservableObject, Identifiable {
             fixLastCommand()
             return true
         }
-
-        // A CLI still running background tasks from the last turn is still reading stdin, so it takes the message itself.
-        if input == nil, !startClaude() { return true }
         let advice: [[String: Any]] = pendingAdvice.isEmpty ? [] : [["type": "text", "text": Self.advicePreamble + pendingAdvice.joined(separator: "\n\n")]]
         pendingAdvice = []
         let content: Any = attached.isEmpty && advice.isEmpty ? text : advice + attached.map { image in
             ["type": "image", "source": ["type": "base64", "media_type": "image/png", "data": image.base64EncodedString()]]
         } + (text.trimmed.isEmpty ? [] : [["type": "text", "text": text]])
-        write(["type": "user", "message": ["role": "user", "content": content]])
+        startTurn(content)
         return true
+    }
+
+    /// A failed turn is sent again this many times before its error is left for the user.
+    private static let maxRetries = 2
+
+    private struct Turn {
+        var content: Any
+        var attempt: Int
+        /// Where the turn's replies start in `messages`.
+        var start: Int
+    }
+
+    private func startTurn(_ content: Any, attempt: Int = 0) {
+        // A CLI still running background tasks from the last turn is still reading stdin, so it takes the message itself.
+        if input == nil, !startClaude() { return }
+        turn = Turn(content: content, attempt: attempt, start: messages.count)
+        turnError = nil
+        write(["type": "user", "message": ["role": "user", "content": content]])
     }
 
     /// Returns false when the CLI couldn't be started.
@@ -386,21 +430,56 @@ final class Session: ObservableObject, Identifiable {
             for await line in Self.lines(of: out) where self.process === process {
                 // The CLI outlives its turn while background tasks run, so the turn ends at its result rather than at exit.
                 guard handle(line: line) else { continue }
-                endTurn()
-                if !queued.isEmpty { send(queued.removeFirst()) } else if advising { advise() }
+                if let turnError { failTurn(turnError) } else { completeTurn() }
             }
             process.waitUntilExit()
             guard self.process === process else { return }
             let stderr = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmed
             if process.terminationReason == .uncaughtSignal || process.terminationStatus == 143 {
                 finish(error: "Claude was interrupted.")
-            } else if isBusy {
-                finish(error: stderr.isEmpty ? "claude exited with status \(process.terminationStatus)" : stderr)
+            } else if isBusy, retryTask == nil {
+                releaseClaude()
+                failTurn(stderr.isEmpty ? "claude exited with status \(process.terminationStatus)" : stderr)
             } else {
-                finish(error: nil)
+                releaseClaude()
             }
         }
         return true
+    }
+
+    private func completeTurn() {
+        endTurn()
+        if !queued.isEmpty {
+            let next = queued.removeFirst()
+            send(next.text, queuedAs: next.id)
+        } else if advising {
+            advise()
+        }
+    }
+
+    /// The tab stays busy through the pause before a retry, so messages sent meanwhile queue behind it.
+    private func failTurn(_ error: String) {
+        let failed = turn
+        endTurn()
+        guard let failed, failed.attempt < Self.maxRetries else {
+            messages.append(ChatMessage(speaker: .system, text: error))
+            if !queued.isEmpty {
+                let next = queued.removeFirst()
+                send(next.text, queuedAs: next.id)
+            }
+            return
+        }
+        // A turn that got partway has its work in the transcript, so it carries on rather than starting over.
+        let gotPartway = messages.dropFirst(failed.start).contains { $0.speaker == .claude || $0.speaker == .tool }
+        let attempt = failed.attempt + 1
+        messages.append(ChatMessage(speaker: .system, text: "\(error)\nRetrying (\(attempt)/\(Self.maxRetries))…"))
+        isBusy = true
+        retryTask = Task {
+            try? await Task.sleep(for: .seconds(2 * attempt))
+            guard !Task.isCancelled else { return }
+            retryTask = nil
+            startTurn(gotPartway ? "continue" : failed.content, attempt: attempt)
+        }
     }
 
     private static let advicePreamble = "A second model reviewed your previous turn. Address its notes, or say why you disagree:\n\n"
@@ -711,17 +790,25 @@ final class Session: ObservableObject, Identifiable {
 
     private func finish(error: String?) {
         if let error { messages.append(ChatMessage(speaker: .system, text: error)) }
-        closeInput()
-        process = nil
-        hasBackgroundTasks = false
+        releaseClaude()
         endTurn()
     }
 
     private func endTurn() {
+        turn = nil
+        turnError = nil
         prompt = nil
         runningTools = [:]
         isBusy = false
         refreshGit()
+    }
+
+    /// Lets go of the CLI; a CLI still running background tasks finishes them unseen.
+    private func releaseClaude() {
+        closeInput()
+        process = nil
+        backgroundTasks = []
+        backgroundCommands = [:]
     }
 
     /// Closing stdin lets the CLI exit once it has nothing left to do.
@@ -742,8 +829,20 @@ final class Session: ObservableObject, Identifiable {
             liveModel = event["model"] as? String
             slashCommands = event["slash_commands"] as? [String] ?? []
         case "system" where event["subtype"] as? String == "background_tasks_changed":
-            hasBackgroundTasks = !(event["tasks"] as? [Any] ?? []).isEmpty
-            if !hasBackgroundTasks, !isBusy { closeInput() }
+            let tasks = event["tasks"] as? [[String: Any]] ?? []
+            backgroundTasks = tasks.compactMap { task in
+                guard let id = task["task_id"] as? String else { return nil }
+                return backgroundTasks.first { $0.id == id } ?? BackgroundTask(id: id, description: task["description"] as? String ?? "")
+            }
+            if backgroundTasks.isEmpty, !isBusy { closeInput() }
+        case "system" where event["subtype"] as? String == "task_started":
+            guard event["is_backgrounded"] as? Bool == true, let id = event["task_id"] as? String else { break }
+            let command = (event["tool_use_id"] as? String).flatMap { backgroundCommands.removeValue(forKey: $0) }
+            if let index = backgroundTasks.firstIndex(where: { $0.id == id }) {
+                backgroundTasks[index].command = command
+            } else {
+                backgroundTasks.append(BackgroundTask(id: id, description: event["description"] as? String ?? "", command: command))
+            }
         case "assistant":
             // A background task finishing starts a turn of its own.
             isBusy = true
@@ -778,10 +877,8 @@ final class Session: ObservableObject, Identifiable {
             // Compaction kicks in at the user's autoCompactWindow, so measure against that when it is lower.
             contextWindow = Self.autoCompactWindow.map { min($0, window ?? $0) } ?? window
             // Kept open while background tasks run, so the next message goes to the CLI still running them.
-            if !hasBackgroundTasks { closeInput() }
-            if event["is_error"] as? Bool == true {
-                messages.append(ChatMessage(speaker: .system, text: event["result"] as? String ?? "Unknown error"))
-            }
+            if backgroundTasks.isEmpty { closeInput() }
+            if event["is_error"] as? Bool == true { turnError = event["result"] as? String ?? "Unknown error" }
             notifyWaiting()
             return true
         default:
@@ -793,7 +890,11 @@ final class Session: ObservableObject, Identifiable {
     private func append(block: [String: Any]) {
         guard let message = Self.message(from: block) else { return }
         messages.append(message)
-        if message.speaker == .tool, let id = block["id"] as? String { runningTools[id] = message.id }
+        if message.speaker == .tool, let id = block["id"] as? String {
+            runningTools[id] = message.id
+            let input = block["input"] as? [String: Any] ?? [:]
+            if input["run_in_background"] as? Bool == true { backgroundCommands[id] = input["command"] as? String }
+        }
         if message.speaker == .claude {
             startTyping(message)
         }
@@ -886,7 +987,7 @@ final class AppStore: ObservableObject {
     private static let selectedKey = "selectedSession"
     private static let foldersKey = "requestFolders"
 
-    private static let supportDirectory: URL = {
+    nonisolated static let supportDirectory: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Pers", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -949,6 +1050,27 @@ final class AppStore: ObservableObject {
         return paths.map { path in RepoGroup(path: path, sessions: sessions.filter { $0.repoPath == path }) }
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
+
+    /// The overview's repos plus the most used ones without open tabs, so those stay a click away.
+    var overviewRepos: [RepoGroup] {
+        let open = Set(sessions.map(\.repoPath))
+        let uses = UserDefaults.standard.dictionary(forKey: Self.usesKey) as? [String: Int] ?? [:]
+        let idle = uses.filter { !open.contains($0.key) && FileManager.default.fileExists(atPath: $0.key) }
+            .sorted { $0.value > $1.value }
+            .prefix(Self.idleRepoCount)
+            .map { RepoGroup(path: $0.key, sessions: []) }
+        return (repos + idle).sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    /// Counted per message sent, which is what "most used" means for `overviewRepos`.
+    static func recordUse(of repoPath: String) {
+        var uses = UserDefaults.standard.dictionary(forKey: usesKey) as? [String: Int] ?? [:]
+        uses[repoPath, default: 0] += 1
+        UserDefaults.standard.set(uses, forKey: usesKey)
+    }
+
+    private static let usesKey = "repoUses"
+    private static let idleRepoCount = 5
 
     func newTab(directory: String? = nil) {
         let base = selected
@@ -1028,6 +1150,13 @@ final class AppStore: ObservableObject {
         guard let data = try? JSONEncoder().encode(sessions.map(\.snapshot)) else { return }
         try? data.write(to: Self.saveURL, options: .atomic)
     }
+}
+
+struct BackgroundTask: Identifiable {
+    var id: String
+    var description: String
+    /// Set for shell commands; background subagents only have a description.
+    var command: String?
 }
 
 struct RepoGroup: Identifiable {

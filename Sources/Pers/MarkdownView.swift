@@ -6,27 +6,15 @@ struct MarkdownView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            ForEach(Array(Self.segments(of: text).enumerated()), id: \.offset) { _, segment in
-                switch segment {
-                case .prose(let prose):
-                    Self.prose(prose)
-                case .code(let language, let code):
+            ForEach(Array(Self.blocks(of: text).enumerated()), id: \.offset) { _, block in
+                switch block {
+                case .text(let styled):
+                    Self.prose(styled)
+                case .segment(.code(let language, let code)):
                     CodeBlock(language: language, code: code)
-                case .list(let items):
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(Array(items.enumerated()), id: \.offset) { _, item in
-                            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                Text(item.marker)
-                                    .font(Theme.body.weight(.heavy))
-                                    .foregroundStyle(Theme.cyan)
-                                Self.prose(item.text)
-                            }
-                            .padding(.leading, CGFloat(item.level) * 18)
-                        }
-                    }
-                case .table(let rows):
+                case .segment(.table(let rows)):
                     MarkdownTable(rows: rows)
-                case .quote(let quote):
+                case .segment(.quote(let quote)):
                     HStack(spacing: 0) {
                         Rectangle().fill(Theme.cyan).frame(width: 3)
                         MarkdownView(text: quote)
@@ -35,18 +23,52 @@ struct MarkdownView: View {
                     }
                     .background(Theme.cyan.opacity(0.08))
                     .fixedSize(horizontal: false, vertical: true)
+                case .segment(.prose), .segment(.list):
+                    EmptyView()
                 }
             }
         }
         .textSelection(.enabled)
     }
 
-    static func prose(_ text: String) -> some View {
-        Text(inline(text))
+    static func prose(_ text: AttributedString) -> some View {
+        Text(text)
             .font(Theme.body)
             .foregroundStyle(Theme.text)
             .lineSpacing(3)
             .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private enum Block {
+        case text(AttributedString)
+        case segment(Segment)
+    }
+
+    /// Runs of prose and lists become one Text, since a selection can't span separate Texts.
+    private static func blocks(of text: String) -> [Block] {
+        segments(of: text).reduce(into: []) { blocks, segment in
+            let styled: AttributedString
+            switch segment {
+            case .prose(let prose): styled = inline(prose)
+            case .list(let items): styled = list(items)
+            default: blocks.append(.segment(segment)); return
+            }
+            if case .text(let previous) = blocks.last {
+                blocks[blocks.count - 1] = .text(previous + AttributedString("\n\n") + styled)
+            } else {
+                blocks.append(.text(styled))
+            }
+        }
+    }
+
+    // shortcut: wrapped list lines start at the left edge instead of under the item's text; fix with a hanging indent if long items read badly.
+    private static func list(_ items: [ListItem]) -> AttributedString {
+        items.enumerated().reduce(into: AttributedString()) { result, entry in
+            var marker = AttributedString((entry.offset == 0 ? "" : "\n") + String(repeating: "    ", count: entry.element.level) + entry.element.marker + " ")
+            marker.font = Theme.body.weight(.heavy)
+            marker.foregroundColor = Theme.cyan
+            result += marker + inline(entry.element.text)
+        }
     }
 
     enum Segment {

@@ -59,11 +59,13 @@ struct ContentView: View {
             .padding(.bottom, 250)
         }
         .overlay(alignment: .topTrailing) {
-            if store.showingActions, let session = store.selected {
-                ActionPanel(session: session)
-                    .padding(.top, 90)
-                    .padding(.trailing, 18)
-                    .padding(.bottom, 250)
+            if let session = store.selected {
+                Group {
+                    if store.showingActions { ActionPanel(session: session) } else { BackgroundPanel(session: session) }
+                }
+                .padding(.top, 90)
+                .padding(.trailing, 18)
+                .padding(.bottom, 250)
             }
         }
         .overlay {
