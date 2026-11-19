@@ -74,6 +74,8 @@ final class Session: ObservableObject, Identifiable {
     private var turnError: String?
     /// The pause before a failed turn is sent again.
     private var retryTask: Task<Void, Never>?
+    /// SEND NOW wrote a message into this turn. One that arrives after Claude's last step gets a turn of its own.
+    private var sentDuringTurn = false
     var extraArguments: (@MainActor () -> [String])?
 
     init(directory: String, model: ClaudeModel = .sonnet, mode: PermissionMode = .claudeDefault) {
@@ -290,6 +292,7 @@ final class Session: ObservableObject, Identifiable {
         guard input != nil, !queued.isEmpty else { return }
         let sending = all ? queued : [queued[0]]
         queued.removeFirst(sending.count)
+        sentDuringTurn = true
         for message in sending { write(["type": "user", "message": ["role": "user", "content": message.text]]) }
     }
 
@@ -799,6 +802,7 @@ final class Session: ObservableObject, Identifiable {
     private func endTurn() {
         turn = nil
         turnError = nil
+        sentDuringTurn = false
         prompt = nil
         runningTools = [:]
         isBusy = false
@@ -826,6 +830,8 @@ final class Session: ObservableObject, Identifiable {
 
         switch event["type"] as? String {
         case "system" where event["subtype"] as? String == "init":
+            // Every turn starts with one, including one for a message SEND NOW wrote after the last turn's final step.
+            isBusy = true
             sessionId = event["session_id"] as? String
             forkAt = nil
             liveModel = event["model"] as? String
@@ -879,8 +885,9 @@ final class Session: ObservableObject, Identifiable {
             let window = main?["contextWindow"] as? Int ?? contextWindow
             // Compaction kicks in at the user's autoCompactWindow, so measure against that when it is lower.
             contextWindow = Self.autoCompactWindow.map { min($0, window ?? $0) } ?? window
-            // Kept open while background tasks run, so the next message goes to the CLI still running them.
-            if backgroundTasks.isEmpty { closeInput() }
+            // Kept open while background tasks run, so the next message goes to the CLI still running them, and after
+            // SEND NOW, so a turn of its own for that message still reaches the chat.
+            if backgroundTasks.isEmpty, !sentDuringTurn { closeInput() }
             if event["is_error"] as? Bool == true { turnError = event["result"] as? String ?? "Unknown error" }
             notifyWaiting()
             return true

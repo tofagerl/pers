@@ -20,6 +20,13 @@ final class SessionQueueTests: XCTestCase {
         XCTAssertFalse(session.isBusy)
     }
 
+    /// A message sent with SEND NOW after Claude's last step gets a turn of its own, which starts with a fresh init.
+    func testInitMakesTheTabBusy() {
+        let session = Session(directory: NSTemporaryDirectory())
+        _ = session.handle(line: #"{"type":"system","subtype":"init","session_id":"abc"}"#)
+        XCTAssertTrue(session.isBusy)
+    }
+
     func testTopLevelEventsMakeTheTabBusy() {
         let session = Session(directory: NSTemporaryDirectory())
         _ = session.handle(line: event(parent: nil))
