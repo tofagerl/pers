@@ -39,6 +39,10 @@ final class Session: ObservableObject, Identifiable {
     @Published private(set) var prompt: PermissionPrompt?
     /// Tool calls Claude started that have no result yet, keyed by tool use id.
     @Published private(set) var runningTools: [String: UUID] = [:]
+    /// Tasks Claude left running in the background. The CLI keeps the turn open until they finish.
+    @Published private(set) var backgroundTasks: [BackgroundTask] = []
+    /// Commands of background tool calls by tool use id, picked up when their task starts.
+    private var backgroundCommands: [String: String] = [:]
     /// The tab's shell, started by its first terminal command and kept for the next ones.
     @Published private(set) var shell: ShellTerminal?
     @Published private(set) var terminalMode = ShellTerminal.Mode()
@@ -759,6 +763,8 @@ final class Session: ObservableObject, Identifiable {
         prompt = nil
         process = nil
         runningTools = [:]
+        backgroundTasks = []
+        backgroundCommands = [:]
         isBusy = false
         refreshGit()
     }
@@ -774,6 +780,20 @@ final class Session: ObservableObject, Identifiable {
             forkAt = nil
             liveModel = event["model"] as? String
             slashCommands = event["slash_commands"] as? [String] ?? []
+        case "system" where event["subtype"] as? String == "background_tasks_changed":
+            let tasks = event["tasks"] as? [[String: Any]] ?? []
+            backgroundTasks = tasks.compactMap { task in
+                guard let id = task["task_id"] as? String else { return nil }
+                return backgroundTasks.first { $0.id == id } ?? BackgroundTask(id: id, description: task["description"] as? String ?? "")
+            }
+        case "system" where event["subtype"] as? String == "task_started":
+            guard event["is_backgrounded"] as? Bool == true, let id = event["task_id"] as? String else { break }
+            let command = (event["tool_use_id"] as? String).flatMap { backgroundCommands.removeValue(forKey: $0) }
+            if let index = backgroundTasks.firstIndex(where: { $0.id == id }) {
+                backgroundTasks[index].command = command
+            } else {
+                backgroundTasks.append(BackgroundTask(id: id, description: event["description"] as? String ?? "", command: command))
+            }
         case "assistant":
             guard event["parent_tool_use_id"] is NSNull || event["parent_tool_use_id"] == nil,
                   let message = event["message"] as? [String: Any],
@@ -820,7 +840,11 @@ final class Session: ObservableObject, Identifiable {
     private func append(block: [String: Any]) {
         guard let message = Self.message(from: block) else { return }
         messages.append(message)
-        if message.speaker == .tool, let id = block["id"] as? String { runningTools[id] = message.id }
+        if message.speaker == .tool, let id = block["id"] as? String {
+            runningTools[id] = message.id
+            let input = block["input"] as? [String: Any] ?? [:]
+            if input["run_in_background"] as? Bool == true { backgroundCommands[id] = input["command"] as? String }
+        }
         if message.speaker == .claude {
             startTyping(message)
         }
@@ -1076,6 +1100,13 @@ final class AppStore: ObservableObject {
         guard let data = try? JSONEncoder().encode(sessions.map(\.snapshot)) else { return }
         try? data.write(to: Self.saveURL, options: .atomic)
     }
+}
+
+struct BackgroundTask: Identifiable {
+    var id: String
+    var description: String
+    /// Set for shell commands; background subagents only have a description.
+    var command: String?
 }
 
 struct RepoGroup: Identifiable {
