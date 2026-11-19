@@ -74,6 +74,8 @@ final class Session: ObservableObject, Identifiable {
     private var turnError: String?
     /// The pause before a failed turn is sent again.
     private var retryTask: Task<Void, Never>?
+    /// SEND NOW wrote a message into this turn. One that arrives after Claude's last step gets a turn of its own.
+    private var sentDuringTurn = false
     var extraArguments: (@MainActor () -> [String])?
 
     init(directory: String, model: ClaudeModel = .sonnet, mode: PermissionMode = .claudeDefault) {
@@ -290,6 +292,7 @@ final class Session: ObservableObject, Identifiable {
         guard input != nil, !queued.isEmpty else { return }
         let sending = all ? queued : [queued[0]]
         queued.removeFirst(sending.count)
+        sentDuringTurn = true
         for message in sending { write(["type": "user", "message": ["role": "user", "content": message.text]]) }
     }
 
@@ -447,14 +450,22 @@ final class Session: ObservableObject, Identifiable {
         return true
     }
 
+    /// Known gap: after SEND NOW the CLI may still owe a turn of its own for that message, but the next queued one is
+    /// written right away. The CLI answers the owed turn first, so its result ends the queued message's turn: the tab
+    /// reads idle while Claude works, and retries and the advisor act on the wrong turn. Nothing is lost. Waiting for
+    /// a following init before sending would fix it, but how long to wait needs data on how soon one arrives.
     private func completeTurn() {
         endTurn()
-        if !queued.isEmpty {
-            let next = queued.removeFirst()
-            send(next.text, queuedAs: next.id)
-        } else if advising {
-            advise()
-        }
+        if !sendNextQueued(), advising { advise() }
+    }
+
+    /// Returns whether there was a queued message to send.
+    @discardableResult
+    private func sendNextQueued() -> Bool {
+        guard !queued.isEmpty else { return false }
+        let next = queued.removeFirst()
+        send(next.text, queuedAs: next.id)
+        return true
     }
 
     /// The tab stays busy through the pause before a retry, so messages sent meanwhile queue behind it.
@@ -463,10 +474,7 @@ final class Session: ObservableObject, Identifiable {
         endTurn()
         guard let failed, failed.attempt < Self.maxRetries else {
             messages.append(ChatMessage(speaker: .system, text: error))
-            if !queued.isEmpty {
-                let next = queued.removeFirst()
-                send(next.text, queuedAs: next.id)
-            }
+            sendNextQueued()
             return
         }
         // A turn that got partway has its work in the transcript, so it carries on rather than starting over.
@@ -792,11 +800,13 @@ final class Session: ObservableObject, Identifiable {
         if let error { messages.append(ChatMessage(speaker: .system, text: error)) }
         releaseClaude()
         endTurn()
+        sendNextQueued()
     }
 
     private func endTurn() {
         turn = nil
         turnError = nil
+        sentDuringTurn = false
         prompt = nil
         runningTools = [:]
         isBusy = false
@@ -818,12 +828,14 @@ final class Session: ObservableObject, Identifiable {
     }
 
     /// Returns true when the line was the final `result` event.
-    private func handle(line: String) -> Bool {
+    func handle(line: String) -> Bool {
         guard let data = line.data(using: .utf8),
               let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
 
         switch event["type"] as? String {
         case "system" where event["subtype"] as? String == "init":
+            // Every turn starts with one, including one for a message SEND NOW wrote after the last turn's final step.
+            isBusy = true
             sessionId = event["session_id"] as? String
             forkAt = nil
             liveModel = event["model"] as? String
@@ -844,10 +856,11 @@ final class Session: ObservableObject, Identifiable {
                 backgroundTasks.append(BackgroundTask(id: id, description: event["description"] as? String ?? "", command: command))
             }
         case "assistant":
+            // Subagents, including ones left running in the background after the turn's result, aren't Claude's turn.
+            guard event["parent_tool_use_id"] is NSNull || event["parent_tool_use_id"] == nil else { break }
             // A background task finishing starts a turn of its own.
             isBusy = true
-            guard event["parent_tool_use_id"] is NSNull || event["parent_tool_use_id"] == nil,
-                  let message = event["message"] as? [String: Any],
+            guard let message = event["message"] as? [String: Any],
                   let blocks = message["content"] as? [[String: Any]] else { break }
             for block in blocks { append(block: block) }
             if let usage = message["usage"] as? [String: Any] {
@@ -876,8 +889,9 @@ final class Session: ObservableObject, Identifiable {
             let window = main?["contextWindow"] as? Int ?? contextWindow
             // Compaction kicks in at the user's autoCompactWindow, so measure against that when it is lower.
             contextWindow = Self.autoCompactWindow.map { min($0, window ?? $0) } ?? window
-            // Kept open while background tasks run, so the next message goes to the CLI still running them.
-            if backgroundTasks.isEmpty { closeInput() }
+            // Kept open while background tasks run, so the next message goes to the CLI still running them, and after
+            // SEND NOW, so a turn of its own for that message still reaches the chat.
+            if backgroundTasks.isEmpty, !sentDuringTurn { closeInput() }
             if event["is_error"] as? Bool == true { turnError = event["result"] as? String ?? "Unknown error" }
             notifyWaiting()
             return true
