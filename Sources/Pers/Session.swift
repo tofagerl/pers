@@ -59,6 +59,7 @@ final class Session: ObservableObject, Identifiable {
     private var forkAt: String?
     private var process: Process?
     private var input: FileHandle?
+    private var hasBackgroundTasks = false
     private var typer: Timer?
     private var fix: String?
     private var advisor: Process?
@@ -243,6 +244,12 @@ final class Session: ObservableObject, Identifiable {
         forkAt = nil
         contextTokens = nil
         outfit = Int.random(in: 0..<1000)
+        // A CLI kept open for background tasks belongs to the old session; it finishes them unseen.
+        if !isBusy {
+            closeInput()
+            process = nil
+            hasBackgroundTasks = false
+        }
         advisor?.terminate()
         advisor = nil
         pendingAdvice = []
@@ -339,6 +346,19 @@ final class Session: ObservableObject, Identifiable {
             return true
         }
 
+        // A CLI still running background tasks from the last turn is still reading stdin, so it takes the message itself.
+        if input == nil, !startClaude() { return true }
+        let advice: [[String: Any]] = pendingAdvice.isEmpty ? [] : [["type": "text", "text": Self.advicePreamble + pendingAdvice.joined(separator: "\n\n")]]
+        pendingAdvice = []
+        let content: Any = attached.isEmpty && advice.isEmpty ? text : advice + attached.map { image in
+            ["type": "image", "source": ["type": "base64", "media_type": "image/png", "data": image.base64EncodedString()]]
+        } + (text.trimmed.isEmpty ? [] : [["type": "text", "text": text]])
+        write(["type": "user", "message": ["role": "user", "content": content]])
+        return true
+    }
+
+    /// Returns false when the CLI couldn't be started.
+    private func startClaude() -> Bool {
         var args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                     "--permission-prompt-tool", "stdio", "--model", model.rawValue, "--permission-mode", mode.rawValue]
         if let effort { args += ["--effort", effort.rawValue] }
@@ -356,31 +376,28 @@ final class Session: ObservableObject, Identifiable {
             try process.run()
         } catch {
             finish(error: error.localizedDescription)
-            return true
+            return false
         }
         self.process = process
         input = stdin.fileHandleForWriting
-        let advice: [[String: Any]] = pendingAdvice.isEmpty ? [] : [["type": "text", "text": Self.advicePreamble + pendingAdvice.joined(separator: "\n\n")]]
-        pendingAdvice = []
-        let content: Any = attached.isEmpty && advice.isEmpty ? text : advice + attached.map { image in
-            ["type": "image", "source": ["type": "base64", "media_type": "image/png", "data": image.base64EncodedString()]]
-        } + (text.trimmed.isEmpty ? [] : [["type": "text", "text": text]])
-        write(["type": "user", "message": ["role": "user", "content": content]])
 
         Task {
-            var gotResult = false
-            for await line in Self.lines(of: out) {
-                if handle(line: line) { gotResult = true }
+            // A CLI replaced by a newer one, or let go of for a new session, may still be finishing up; its output no longer belongs here.
+            for await line in Self.lines(of: out) where self.process === process {
+                // The CLI outlives its turn while background tasks run, so the turn ends at its result rather than at exit.
+                guard handle(line: line) else { continue }
+                endTurn()
+                if !queued.isEmpty { send(queued.removeFirst()) } else if advising { advise() }
             }
             process.waitUntilExit()
+            guard self.process === process else { return }
             let stderr = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmed
             if process.terminationReason == .uncaughtSignal || process.terminationStatus == 143 {
                 finish(error: "Claude was interrupted.")
-            } else if !gotResult {
+            } else if isBusy {
                 finish(error: stderr.isEmpty ? "claude exited with status \(process.terminationStatus)" : stderr)
             } else {
                 finish(error: nil)
-                if !queued.isEmpty { send(queued.removeFirst()) } else if advising { advise() }
             }
         }
         return true
@@ -694,13 +711,23 @@ final class Session: ObservableObject, Identifiable {
 
     private func finish(error: String?) {
         if let error { messages.append(ChatMessage(speaker: .system, text: error)) }
-        try? input?.close()
-        input = nil
-        prompt = nil
+        closeInput()
         process = nil
+        hasBackgroundTasks = false
+        endTurn()
+    }
+
+    private func endTurn() {
+        prompt = nil
         runningTools = [:]
         isBusy = false
         refreshGit()
+    }
+
+    /// Closing stdin lets the CLI exit once it has nothing left to do.
+    private func closeInput() {
+        try? input?.close()
+        input = nil
     }
 
     /// Returns true when the line was the final `result` event.
@@ -714,7 +741,12 @@ final class Session: ObservableObject, Identifiable {
             forkAt = nil
             liveModel = event["model"] as? String
             slashCommands = event["slash_commands"] as? [String] ?? []
+        case "system" where event["subtype"] as? String == "background_tasks_changed":
+            hasBackgroundTasks = !(event["tasks"] as? [Any] ?? []).isEmpty
+            if !hasBackgroundTasks, !isBusy { closeInput() }
         case "assistant":
+            // A background task finishing starts a turn of its own.
+            isBusy = true
             guard event["parent_tool_use_id"] is NSNull || event["parent_tool_use_id"] == nil,
                   let message = event["message"] as? [String: Any],
                   let blocks = message["content"] as? [[String: Any]] else { break }
@@ -745,9 +777,8 @@ final class Session: ObservableObject, Identifiable {
             let window = main?["contextWindow"] as? Int ?? contextWindow
             // Compaction kicks in at the user's autoCompactWindow, so measure against that when it is lower.
             contextWindow = Self.autoCompactWindow.map { min($0, window ?? $0) } ?? window
-            // Closing stdin lets the CLI exit now that the turn is over.
-            try? input?.close()
-            input = nil
+            // Kept open while background tasks run, so the next message goes to the CLI still running them.
+            if !hasBackgroundTasks { closeInput() }
             if event["is_error"] as? Bool == true {
                 messages.append(ChatMessage(speaker: .system, text: event["result"] as? String ?? "Unknown error"))
             }
