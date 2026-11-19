@@ -347,6 +347,7 @@ final class Session: ObservableObject, Identifiable {
         } else {
             messages.append(ChatMessage(speaker: .user, text: text.trimmed, images: attached.isEmpty ? nil : attached))
         }
+        AppStore.recordUse(of: repoPath)
         if let command, !usesClaude {
             runShell(command)
             return true
@@ -941,6 +942,27 @@ final class AppStore: ObservableObject {
         return paths.map { path in RepoGroup(path: path, sessions: sessions.filter { $0.repoPath == path }) }
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
+
+    /// The overview's repos plus the most used ones without open tabs, so those stay a click away.
+    var overviewRepos: [RepoGroup] {
+        let open = Set(sessions.map(\.repoPath))
+        let uses = UserDefaults.standard.dictionary(forKey: Self.usesKey) as? [String: Int] ?? [:]
+        let idle = uses.filter { !open.contains($0.key) && FileManager.default.fileExists(atPath: $0.key) }
+            .sorted { $0.value > $1.value }
+            .prefix(Self.idleRepoCount)
+            .map { RepoGroup(path: $0.key, sessions: []) }
+        return (repos + idle).sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    /// Counted per message sent, which is what "most used" means for `overviewRepos`.
+    static func recordUse(of repoPath: String) {
+        var uses = UserDefaults.standard.dictionary(forKey: usesKey) as? [String: Int] ?? [:]
+        uses[repoPath, default: 0] += 1
+        UserDefaults.standard.set(uses, forKey: usesKey)
+    }
+
+    private static let usesKey = "repoUses"
+    private static let idleRepoCount = 5
 
     func newTab(directory: String? = nil) {
         let base = selected

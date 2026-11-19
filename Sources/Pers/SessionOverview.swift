@@ -14,11 +14,14 @@ struct SessionOverview: View {
                              (KeyAction.closeTab.label, "close"), (KeyAction.actions.label, "actions"), (KeyAction.map.label, "map")])
             ScrollView(showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 14) {
-                    ForEach(store.repos) { repo in
+                    ForEach(store.overviewRepos) { repo in
                         VStack(alignment: .leading, spacing: 4) {
+                            // Repos kept for being used often have no tabs; clicking the name opens one there.
                             NamePlate(name: repo.name.uppercased(), color: Theme.cyan)
                                 .lineLimit(1)
                                 .padding(.leading, 4)
+                                .opacity(repo.sessions.isEmpty ? 0.5 : 1)
+                                .onTapGesture { if repo.sessions.isEmpty { store.newTab(directory: repo.path) } }
                             ForEach(repo.sessions) { session in
                                 OverviewRow(session: session, selected: session.id == store.selectedId, navigator: navigator)
                             }
