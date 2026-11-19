@@ -64,6 +64,10 @@ final class Session: ObservableObject, Identifiable {
     private var fix: String?
     private var advisor: Process?
     private var pendingAdvice: [String] = []
+    /// The error the turn's `result` event reported, if any.
+    private var turnError: String?
+    /// The pause before a failed turn is sent again.
+    private var retryTask: Task<Void, Never>?
     var extraArguments: (@MainActor () -> [String])?
 
     init(directory: String, model: ClaudeModel = .sonnet, mode: PermissionMode = .claudeDefault) {
@@ -284,6 +288,11 @@ final class Session: ObservableObject, Identifiable {
     func stopClaude() {
         queued.forEach { cancelQueued($0.id) }
         process?.terminate()
+        if let retryTask {
+            retryTask.cancel()
+            self.retryTask = nil
+            finish(error: "Claude was interrupted.")
+        }
         resolveFix("Cancel")
     }
 
@@ -357,7 +366,19 @@ final class Session: ObservableObject, Identifiable {
             fixLastCommand()
             return true
         }
+        let advice: [[String: Any]] = pendingAdvice.isEmpty ? [] : [["type": "text", "text": Self.advicePreamble + pendingAdvice.joined(separator: "\n\n")]]
+        pendingAdvice = []
+        let content: Any = attached.isEmpty && advice.isEmpty ? text : advice + attached.map { image in
+            ["type": "image", "source": ["type": "base64", "media_type": "image/png", "data": image.base64EncodedString()]]
+        } + (text.trimmed.isEmpty ? [] : [["type": "text", "text": text]])
+        startTurn(content)
+        return true
+    }
 
+    /// A failed turn is sent again this many times before its error is left for the user.
+    private static let maxRetries = 2
+
+    private func startTurn(_ content: Any, attempt: Int = 0) {
         var args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                     "--permission-prompt-tool", "stdio", "--model", model.rawValue, "--permission-mode", mode.rawValue]
         if let effort { args += ["--effort", effort.rawValue] }
@@ -375,16 +396,13 @@ final class Session: ObservableObject, Identifiable {
             try process.run()
         } catch {
             finish(error: error.localizedDescription)
-            return true
+            return
         }
         self.process = process
         input = stdin.fileHandleForWriting
-        let advice: [[String: Any]] = pendingAdvice.isEmpty ? [] : [["type": "text", "text": Self.advicePreamble + pendingAdvice.joined(separator: "\n\n")]]
-        pendingAdvice = []
-        let content: Any = attached.isEmpty && advice.isEmpty ? text : advice + attached.map { image in
-            ["type": "image", "source": ["type": "base64", "media_type": "image/png", "data": image.base64EncodedString()]]
-        } + (text.trimmed.isEmpty ? [] : [["type": "text", "text": text]])
+        turnError = nil
         write(["type": "user", "message": ["role": "user", "content": content]])
+        let start = messages.count
 
         Task {
             var gotResult = false
@@ -395,8 +413,10 @@ final class Session: ObservableObject, Identifiable {
             let stderr = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmed
             if process.terminationReason == .uncaughtSignal || process.terminationStatus == 143 {
                 finish(error: "Claude was interrupted.")
-            } else if !gotResult {
-                finish(error: stderr.isEmpty ? "claude exited with status \(process.terminationStatus)" : stderr)
+            } else if let error = gotResult ? turnError : stderr.isEmpty ? "claude exited with status \(process.terminationStatus)" : stderr {
+                // A turn that got partway has its work in the transcript, so it carries on rather than starting over.
+                let gotPartway = messages.dropFirst(start).contains { $0.speaker == .claude || $0.speaker == .tool }
+                retry(gotPartway ? "continue" : content, after: error, attempt: attempt + 1)
             } else {
                 finish(error: nil)
                 if !queued.isEmpty {
@@ -407,7 +427,23 @@ final class Session: ObservableObject, Identifiable {
                 }
             }
         }
-        return true
+    }
+
+    /// The tab stays busy through the pause, so messages sent meanwhile queue behind the retry.
+    private func retry(_ content: Any, after error: String, attempt: Int) {
+        guard attempt <= Self.maxRetries else {
+            finish(error: error)
+            if !queued.isEmpty { send(queued.removeFirst()) }
+            return
+        }
+        finish(error: "\(error)\nRetrying (\(attempt)/\(Self.maxRetries))…")
+        isBusy = true
+        retryTask = Task {
+            try? await Task.sleep(for: .seconds(2 * attempt))
+            guard !Task.isCancelled else { return }
+            retryTask = nil
+            startTurn(content, attempt: attempt)
+        }
     }
 
     private static let advicePreamble = "A second model reviewed your previous turn. Address its notes, or say why you disagree:\n\n"
@@ -772,9 +808,7 @@ final class Session: ObservableObject, Identifiable {
             // Closing stdin lets the CLI exit now that the turn is over.
             try? input?.close()
             input = nil
-            if event["is_error"] as? Bool == true {
-                messages.append(ChatMessage(speaker: .system, text: event["result"] as? String ?? "Unknown error"))
-            }
+            if event["is_error"] as? Bool == true { turnError = event["result"] as? String ?? "Unknown error" }
             notifyWaiting()
             return true
         default:
