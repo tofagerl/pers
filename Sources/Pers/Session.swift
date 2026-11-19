@@ -450,6 +450,10 @@ final class Session: ObservableObject, Identifiable {
         return true
     }
 
+    /// Known gap: after SEND NOW the CLI may still owe a turn of its own for that message, but the next queued one is
+    /// written right away. The CLI answers the owed turn first, so its result ends the queued message's turn: the tab
+    /// reads idle while Claude works, and retries and the advisor act on the wrong turn. Nothing is lost. Waiting for
+    /// a following init before sending would fix it, but how long to wait needs data on how soon one arrives.
     private func completeTurn() {
         endTurn()
         if !sendNextQueued(), advising { advise() }
