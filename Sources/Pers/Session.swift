@@ -449,12 +449,16 @@ final class Session: ObservableObject, Identifiable {
 
     private func completeTurn() {
         endTurn()
-        if !queued.isEmpty {
-            let next = queued.removeFirst()
-            send(next.text, queuedAs: next.id)
-        } else if advising {
-            advise()
-        }
+        if !sendNextQueued(), advising { advise() }
+    }
+
+    /// Returns whether there was a queued message to send.
+    @discardableResult
+    private func sendNextQueued() -> Bool {
+        guard !queued.isEmpty else { return false }
+        let next = queued.removeFirst()
+        send(next.text, queuedAs: next.id)
+        return true
     }
 
     /// The tab stays busy through the pause before a retry, so messages sent meanwhile queue behind it.
@@ -463,10 +467,7 @@ final class Session: ObservableObject, Identifiable {
         endTurn()
         guard let failed, failed.attempt < Self.maxRetries else {
             messages.append(ChatMessage(speaker: .system, text: error))
-            if !queued.isEmpty {
-                let next = queued.removeFirst()
-                send(next.text, queuedAs: next.id)
-            }
+            sendNextQueued()
             return
         }
         // A turn that got partway has its work in the transcript, so it carries on rather than starting over.
@@ -792,6 +793,7 @@ final class Session: ObservableObject, Identifiable {
         if let error { messages.append(ChatMessage(speaker: .system, text: error)) }
         releaseClaude()
         endTurn()
+        sendNextQueued()
     }
 
     private func endTurn() {
@@ -818,7 +820,7 @@ final class Session: ObservableObject, Identifiable {
     }
 
     /// Returns true when the line was the final `result` event.
-    private func handle(line: String) -> Bool {
+    func handle(line: String) -> Bool {
         guard let data = line.data(using: .utf8),
               let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
 
@@ -844,10 +846,11 @@ final class Session: ObservableObject, Identifiable {
                 backgroundTasks.append(BackgroundTask(id: id, description: event["description"] as? String ?? "", command: command))
             }
         case "assistant":
+            // Subagents, including ones left running in the background after the turn's result, aren't Claude's turn.
+            guard event["parent_tool_use_id"] is NSNull || event["parent_tool_use_id"] == nil else { break }
             // A background task finishing starts a turn of its own.
             isBusy = true
-            guard event["parent_tool_use_id"] is NSNull || event["parent_tool_use_id"] == nil,
-                  let message = event["message"] as? [String: Any],
+            guard let message = event["message"] as? [String: Any],
                   let blocks = message["content"] as? [[String: Any]] else { break }
             for block in blocks { append(block: block) }
             if let usage = message["usage"] as? [String: Any] {

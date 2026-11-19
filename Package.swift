@@ -8,6 +8,7 @@ let package = Package(
         .package(url: "https://github.com/migueldeicaza/SwiftTerm", from: "1.2.0")
     ],
     targets: [
-        .executableTarget(name: "Pers", dependencies: ["SwiftTerm"], path: "Sources/Pers")
+        .executableTarget(name: "Pers", dependencies: ["SwiftTerm"], path: "Sources/Pers"),
+        .testTarget(name: "PersTests", dependencies: ["Pers"], path: "Tests/PersTests")
     ]
 )
