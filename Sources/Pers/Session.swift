@@ -39,7 +39,7 @@ final class Session: ObservableObject, Identifiable {
     @Published private(set) var prompt: PermissionPrompt?
     /// Tool calls Claude started that have no result yet, keyed by tool use id.
     @Published private(set) var runningTools: [String: UUID] = [:]
-    /// Tasks Claude left running in the background. The CLI keeps the turn open until they finish.
+    /// Tasks Claude left running in the background. The CLI stays up until they finish.
     @Published private(set) var backgroundTasks: [BackgroundTask] = []
     /// Commands of background tool calls by tool use id, picked up when their task starts.
     private var backgroundCommands: [String: String] = [:]
@@ -68,6 +68,8 @@ final class Session: ObservableObject, Identifiable {
     private var fix: String?
     private var advisor: Process?
     private var pendingAdvice: [String] = []
+    /// The message Claude is working on, kept so a failed turn can be sent again.
+    private var turn: Turn?
     /// The error the turn's `result` event reported, if any.
     private var turnError: String?
     /// The pause before a failed turn is sent again.
@@ -252,6 +254,8 @@ final class Session: ObservableObject, Identifiable {
         forkAt = nil
         contextTokens = nil
         outfit = Int.random(in: 0..<1000)
+        // A CLI kept open for background tasks belongs to the old session; it finishes them unseen.
+        if !isBusy { releaseClaude() }
         advisor?.terminate()
         advisor = nil
         pendingAdvice = []
@@ -382,7 +386,23 @@ final class Session: ObservableObject, Identifiable {
     /// A failed turn is sent again this many times before its error is left for the user.
     private static let maxRetries = 2
 
+    private struct Turn {
+        var content: Any
+        var attempt: Int
+        /// Where the turn's replies start in `messages`.
+        var start: Int
+    }
+
     private func startTurn(_ content: Any, attempt: Int = 0) {
+        // A CLI still running background tasks from the last turn is still reading stdin, so it takes the message itself.
+        if input == nil, !startClaude() { return }
+        turn = Turn(content: content, attempt: attempt, start: messages.count)
+        turnError = nil
+        write(["type": "user", "message": ["role": "user", "content": content]])
+    }
+
+    /// Returns false when the CLI couldn't be started.
+    private func startClaude() -> Bool {
         var args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                     "--permission-prompt-tool", "stdio", "--model", model.rawValue, "--permission-mode", mode.rawValue]
         if let effort { args += ["--effort", effort.rawValue] }
@@ -400,53 +420,65 @@ final class Session: ObservableObject, Identifiable {
             try process.run()
         } catch {
             finish(error: error.localizedDescription)
-            return
+            return false
         }
         self.process = process
         input = stdin.fileHandleForWriting
-        turnError = nil
-        write(["type": "user", "message": ["role": "user", "content": content]])
-        let start = messages.count
 
         Task {
-            var gotResult = false
-            for await line in Self.lines(of: out) {
-                if handle(line: line) { gotResult = true }
+            // A CLI replaced by a newer one, or let go of for a new session, may still be finishing up; its output no longer belongs here.
+            for await line in Self.lines(of: out) where self.process === process {
+                // The CLI outlives its turn while background tasks run, so the turn ends at its result rather than at exit.
+                guard handle(line: line) else { continue }
+                if let turnError { failTurn(turnError) } else { completeTurn() }
             }
             process.waitUntilExit()
+            guard self.process === process else { return }
             let stderr = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmed
             if process.terminationReason == .uncaughtSignal || process.terminationStatus == 143 {
                 finish(error: "Claude was interrupted.")
-            } else if let error = gotResult ? turnError : stderr.isEmpty ? "claude exited with status \(process.terminationStatus)" : stderr {
-                // A turn that got partway has its work in the transcript, so it carries on rather than starting over.
-                let gotPartway = messages.dropFirst(start).contains { $0.speaker == .claude || $0.speaker == .tool }
-                retry(gotPartway ? "continue" : content, after: error, attempt: attempt + 1)
+            } else if isBusy, retryTask == nil {
+                releaseClaude()
+                failTurn(stderr.isEmpty ? "claude exited with status \(process.terminationStatus)" : stderr)
             } else {
-                finish(error: nil)
-                if !queued.isEmpty {
-                    let next = queued.removeFirst()
-                    send(next.text, queuedAs: next.id)
-                } else if advising {
-                    advise()
-                }
+                releaseClaude()
             }
+        }
+        return true
+    }
+
+    private func completeTurn() {
+        endTurn()
+        if !queued.isEmpty {
+            let next = queued.removeFirst()
+            send(next.text, queuedAs: next.id)
+        } else if advising {
+            advise()
         }
     }
 
-    /// The tab stays busy through the pause, so messages sent meanwhile queue behind the retry.
-    private func retry(_ content: Any, after error: String, attempt: Int) {
-        guard attempt <= Self.maxRetries else {
-            finish(error: error)
-            if !queued.isEmpty { send(queued.removeFirst()) }
+    /// The tab stays busy through the pause before a retry, so messages sent meanwhile queue behind it.
+    private func failTurn(_ error: String) {
+        let failed = turn
+        endTurn()
+        guard let failed, failed.attempt < Self.maxRetries else {
+            messages.append(ChatMessage(speaker: .system, text: error))
+            if !queued.isEmpty {
+                let next = queued.removeFirst()
+                send(next.text, queuedAs: next.id)
+            }
             return
         }
-        finish(error: "\(error)\nRetrying (\(attempt)/\(Self.maxRetries))…")
+        // A turn that got partway has its work in the transcript, so it carries on rather than starting over.
+        let gotPartway = messages.dropFirst(failed.start).contains { $0.speaker == .claude || $0.speaker == .tool }
+        let attempt = failed.attempt + 1
+        messages.append(ChatMessage(speaker: .system, text: "\(error)\nRetrying (\(attempt)/\(Self.maxRetries))…"))
         isBusy = true
         retryTask = Task {
             try? await Task.sleep(for: .seconds(2 * attempt))
             guard !Task.isCancelled else { return }
             retryTask = nil
-            startTurn(content, attempt: attempt)
+            startTurn(gotPartway ? "continue" : failed.content, attempt: attempt)
         }
     }
 
@@ -758,15 +790,31 @@ final class Session: ObservableObject, Identifiable {
 
     private func finish(error: String?) {
         if let error { messages.append(ChatMessage(speaker: .system, text: error)) }
-        try? input?.close()
-        input = nil
+        releaseClaude()
+        endTurn()
+    }
+
+    private func endTurn() {
+        turn = nil
+        turnError = nil
         prompt = nil
-        process = nil
         runningTools = [:]
-        backgroundTasks = []
-        backgroundCommands = [:]
         isBusy = false
         refreshGit()
+    }
+
+    /// Lets go of the CLI; a CLI still running background tasks finishes them unseen.
+    private func releaseClaude() {
+        closeInput()
+        process = nil
+        backgroundTasks = []
+        backgroundCommands = [:]
+    }
+
+    /// Closing stdin lets the CLI exit once it has nothing left to do.
+    private func closeInput() {
+        try? input?.close()
+        input = nil
     }
 
     /// Returns true when the line was the final `result` event.
@@ -786,6 +834,7 @@ final class Session: ObservableObject, Identifiable {
                 guard let id = task["task_id"] as? String else { return nil }
                 return backgroundTasks.first { $0.id == id } ?? BackgroundTask(id: id, description: task["description"] as? String ?? "")
             }
+            if backgroundTasks.isEmpty, !isBusy { closeInput() }
         case "system" where event["subtype"] as? String == "task_started":
             guard event["is_backgrounded"] as? Bool == true, let id = event["task_id"] as? String else { break }
             let command = (event["tool_use_id"] as? String).flatMap { backgroundCommands.removeValue(forKey: $0) }
@@ -795,6 +844,8 @@ final class Session: ObservableObject, Identifiable {
                 backgroundTasks.append(BackgroundTask(id: id, description: event["description"] as? String ?? "", command: command))
             }
         case "assistant":
+            // A background task finishing starts a turn of its own.
+            isBusy = true
             guard event["parent_tool_use_id"] is NSNull || event["parent_tool_use_id"] == nil,
                   let message = event["message"] as? [String: Any],
                   let blocks = message["content"] as? [[String: Any]] else { break }
@@ -825,9 +876,8 @@ final class Session: ObservableObject, Identifiable {
             let window = main?["contextWindow"] as? Int ?? contextWindow
             // Compaction kicks in at the user's autoCompactWindow, so measure against that when it is lower.
             contextWindow = Self.autoCompactWindow.map { min($0, window ?? $0) } ?? window
-            // Closing stdin lets the CLI exit now that the turn is over.
-            try? input?.close()
-            input = nil
+            // Kept open while background tasks run, so the next message goes to the CLI still running them.
+            if backgroundTasks.isEmpty { closeInput() }
             if event["is_error"] as? Bool == true { turnError = event["result"] as? String ?? "Unknown error" }
             notifyWaiting()
             return true
